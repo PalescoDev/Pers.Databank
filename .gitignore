@@ -1,0 +1,16 @@
+# Die Datenbankdatei entsteht beim ersten Start
+daten.db
+
+# Die fertig gebaute Anwendung (mit app_bauen.py jederzeit neu erzeugbar)
+Pers.Databank.app/
+Pers.Databank.exe
+Pers.Databank
+bau_dateien/
+
+# Fertige Pakete zum Hochladen als Release-Asset
+release/
+
+# Von Python und macOS automatisch erzeugte Dateien
+__pycache__/
+*.pyc
+.DS_Store

@@ -1,0 +1,427 @@
+# Builds the ready-made programs for Windows and macOS whenever a version tag
+# such as v1.0.0 is pushed, and attaches them to the GitHub release.
+#
+# End users need neither Python nor any extra package: the Python runtime and
+# the interface are packed into each file.
+
+name: Build release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:      # allows a trial run without a tag
+
+permissions:
+  contents: write         # needed to create the release
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+
+  # ---------------------------------------------------------------------
+  # 1. Check the source before anything is built
+  # ---------------------------------------------------------------------
+  check:
+    name: Check source
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get the source
+        uses: actions/checkout@v4
+
+      - name: No databases, test data or leftovers
+        run: |
+          set -e
+          failed=0
+          for pattern in "daten.db" "*.csv" "*.sqlite" "*.sqlite3" "__pycache__" "*.pyc" "bau_dateien" ".DS_Store"; do
+            found=$(find . -path ./.git -prune -o -name "$pattern" -print)
+            if [ -n "$found" ]; then
+              echo "::error::Unwanted file in the repository: $found"
+              failed=1
+            fi
+          done
+          if [ -d "release" ]; then
+            echo "::error::The folder release/ does not belong in the repository."
+            failed=1
+          fi
+          for suffix in exe app zip dmg; do
+            found=$(find . -path ./.git -prune -o -name "*.$suffix" -print)
+            if [ -n "$found" ]; then
+              echo "::error::Pre-built file in the repository: $found"
+              failed=1
+            fi
+          done
+          if [ "$failed" -eq 1 ]; then exit 1; fi
+          echo "No unwanted files found."
+
+      - name: No credentials in the source
+        run: |
+          set -e
+          if grep -rniE "(api[_-]?key|secret[_-]?key|access[_-]?token|password *= *[\"'][^\"']|BEGIN [A-Z ]*PRIVATE KEY)" \
+              --include="*.py" --include="*.yml" --include="*.md" . ; then
+            echo "::error::Possible credential found in the source."
+            exit 1
+          fi
+          echo "No credentials found."
+
+      - name: All required files present
+        run: |
+          set -e
+          for file in start.py datenbank.py oberflaeche.py dialoge.py austausch.py einstellungen.py sprache.py design.py app_bauen.py README.md LICENSE; do
+            if [ ! -f "$file" ]; then
+              echo "::error::The file $file is missing."
+              exit 1
+            fi
+          done
+          echo "All program files present."
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Source compiles without errors
+        run: python -m compileall -q start.py datenbank.py oberflaeche.py dialoge.py austausch.py einstellungen.py sprache.py design.py app_bauen.py
+
+      - name: Regression tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Database, search, import and export work
+        run: |
+          set -e
+          # There is no screen on the build machine, so the part without a
+          # window is exercised: create the database, write a record, read it
+          # back, and run the import and export path.
+          python - <<'CHECK'
+          import csv, os, tempfile
+          import datenbank, austausch
+
+          folder = tempfile.mkdtemp()
+          datenbank.DATENBANK_DATEI = os.path.join(folder, "check.db")
+          datenbank.datenbank_vorbereiten()
+
+          # A fresh file starts out empty - the program creates nothing by itself.
+          assert datenbank.datenbanken_liste() == [], "a new file should be empty"
+
+          datenbank.datenbank_anlegen("Customers", [
+              ("Name", "text", None),
+              ("City", "text", None),
+              ("Customer since", "datum", None),
+          ])
+          names = [e["name"] for e in datenbank.datenbanken_liste()]
+          assert names == ["Customers"], names
+
+          customers = datenbank.datenbanken_liste()[0]
+          fields = datenbank.felder_liste(customers["id"])
+          new = datenbank.datensatz_hinzufuegen(customers["id"], {fields[0]["id"]: "Check entry"})
+          assert datenbank.datensatz_holen(customers["id"], new)[fields[0]["spalte"]] == "Check entry"
+          assert datenbank.anzahl_datensaetze(customers["id"], "Check") == 1
+
+          # Export and import without a window
+          path = os.path.join(folder, "check.csv")
+          assert austausch.datei_schreiben(path, customers["id"], fields) == 1
+          headings, exported = austausch.datei_einlesen(path)
+          assert headings[0] == fields[0]["anzeigename"], headings
+          assert exported[0][0] == "Check entry", exported
+
+          import_path = os.path.join(folder, "import.csv")
+          with open(import_path, "w", encoding="utf-8-sig", newline="") as f:
+              writer = csv.writer(f, delimiter=";")
+              writer.writerow([field["anzeigename"] for field in fields])
+              writer.writerow(["From the file"] + [""] * (len(fields) - 1))
+          headings, rows = austausch.datei_einlesen(import_path)
+          assert headings[0] == fields[0]["anzeigename"], headings
+          assert rows[0][0] == "From the file", rows
+          added, updated = datenbank.csv_datensaetze_uebernehmen(
+              customers["id"], headings, rows, False, [], None, fields)
+          assert (added, updated) == (1, 0), (added, updated)
+          assert datenbank.anzahl_datensaetze(customers["id"]) == 2
+
+          # Settings are stored in the same file. Only the storage is checked
+          # here; the page itself needs a window and cannot run on the runner.
+          assert datenbank.einstellungen_lesen() == {}
+          datenbank.einstellung_speichern("farbmodus", "dunkel")
+          datenbank.einstellung_speichern("farbmodus", "hell")
+          datenbank.einstellung_speichern("datensaetze_pro_seite", "25")
+          stored = datenbank.einstellungen_lesen()
+          assert stored == {"farbmodus": "hell", "datensaetze_pro_seite": "25"}, stored
+
+          # Renaming must not touch the data underneath
+          datenbank.datenbank_umbenennen(customers["id"], "Clients")
+          datenbank.feld_umbenennen(customers["id"], fields[0]["id"], "Full name")
+          renamed = datenbank.felder_liste(customers["id"])[0]
+          assert datenbank.datenbank_holen(customers["id"])["name"] == "Clients"
+          assert renamed["anzeigename"] == "Full name"
+          assert renamed["spalte"] == fields[0]["spalte"], renamed["spalte"]
+          assert datenbank.anzahl_datensaetze(customers["id"]) == 2
+
+          # Impossible dates are rejected, real ones are not
+          for bad in ("2026-02-31", "2025-02-29", "2026-13-01"):
+              try:
+                  datenbank.wert_aus_eingabe("datum", bad)
+                  raise AssertionError(bad + " was accepted")
+              except ValueError:
+                  pass
+          assert datenbank.wert_aus_eingabe("datum", "2024-02-29") == "2024-02-29"
+
+          # Changing the type of a field keeps the records
+          datenbank.feld_typ_aendern(customers["id"], fields[1]["id"], "auswahl", "A\nB")
+          changed = datenbank.felder_liste(customers["id"])[1]
+          assert changed["typ"] == "auswahl", changed["typ"]
+          assert datenbank.anzahl_datensaetze(customers["id"]) == 2
+
+          # Moving a field changes the order and renumbers the positions
+          order_before = [f["anzeigename"] for f in datenbank.felder_liste(customers["id"])]
+          assert datenbank.feld_verschieben(customers["id"], fields[0]["id"], 1)
+          order_after = [f["anzeigename"] for f in datenbank.felder_liste(customers["id"])]
+          assert order_after[0] == order_before[1], order_after
+          assert not datenbank.feld_verschieben(customers["id"], fields[0]["id"], -99)
+
+          # Importing with a key updates instead of adding a second time.
+          # The key is the renamed name field - it moved, so look it up by id.
+          key = None
+          for field in datenbank.felder_liste(customers["id"]):
+              if field["id"] == fields[0]["id"]:
+                  key = field
+          assert key is not None
+          added, updated = datenbank.datensaetze_abgleichen(
+              customers["id"], [{key["id"]: "From the file"}], key)
+          assert (added, updated) == (0, 1), (added, updated)
+          assert datenbank.anzahl_datensaetze(customers["id"]) == 2
+
+          # A copy of the database, and compacting it afterwards
+          copy_path = os.path.join(folder, "copy.db")
+          datenbank.sicherung_schreiben(copy_path)
+          assert os.path.getsize(copy_path) > 0
+          datenbank.aufraeumen()
+
+          connection = datenbank.verbindung_holen()
+          assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+          datenbank.datenbank_schliessen()
+          print("Database, search, import, export, renaming, backup and settings all work.")
+          CHECK
+
+  # ---------------------------------------------------------------------
+  # 2. Windows: a single EXE
+  # ---------------------------------------------------------------------
+  windows:
+    name: Build Windows program
+    needs: check
+    runs-on: windows-latest
+    steps:
+      - name: Get the source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Regression tests on Windows
+        run: python -m unittest discover -s tests -v
+
+      - name: Install build tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller
+
+      - name: Build the application
+        run: python app_bauen.py
+
+      - name: Check and rename the result
+        shell: bash
+        run: |
+          set -e
+          if [ ! -f "Pers.Databank.exe" ]; then
+            echo "::error::The Windows build produced no Pers.Databank.exe."
+            ls -la
+            exit 1
+          fi
+          size=$(stat -c%s "Pers.Databank.exe" 2>/dev/null || stat -f%z "Pers.Databank.exe")
+          if [ "$size" -lt 3000000 ]; then
+            echo "::error::The resulting EXE is only $size bytes - something is missing."
+            exit 1
+          fi
+          mv "Pers.Databank.exe" "Pers.Databank-Windows.exe"
+          echo "Pers.Databank-Windows.exe created ($size bytes)."
+
+      - name: Is it a valid program?
+        shell: bash
+        run: |
+          set -e
+          # The window cannot be shown on the build machine, so instead we
+          # verify that the file really is a Windows executable.
+          head=$(head -c 2 "Pers.Databank-Windows.exe")
+          if [ "$head" != "MZ" ]; then
+            echo "::error::The file is not a Windows executable."
+            exit 1
+          fi
+          echo "The file is a valid Windows executable."
+
+      - name: Hand over the result
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-program
+          path: Pers.Databank-Windows.exe
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------
+  # 3. macOS: an .app, packed cleanly into a ZIP
+  # ---------------------------------------------------------------------
+  macos:
+    name: Build macOS program
+    needs: check
+    runs-on: macos-latest
+    steps:
+      - name: Get the source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Regression tests on macOS
+        run: python -m unittest discover -s tests -v
+
+      - name: Install build tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller
+
+      - name: Build the application
+        run: python app_bauen.py
+
+      - name: Check the result
+        run: |
+          set -e
+          if [ ! -d "Pers.Databank.app" ]; then
+            echo "::error::The macOS build produced no Pers.Databank.app."
+            ls -la
+            exit 1
+          fi
+          if [ ! -x "Pers.Databank.app/Contents/MacOS/Pers.Databank" ]; then
+            echo "::error::The executable inside the bundle is missing."
+            exit 1
+          fi
+          echo "The application bundle is complete."
+
+      - name: Pack it cleanly
+        run: |
+          set -e
+          # Remove file-system extras so no __MACOSX folder ends up in the
+          # archive, then sign ad-hoc again.
+          xattr -cr "Pers.Databank.app"
+          codesign --force --deep --sign - "Pers.Databank.app"
+          ditto -c -k --keepParent "Pers.Databank.app" "Pers.Databank-macOS.zip"
+
+      - name: Check the archive
+        run: |
+          set -e
+          if [ ! -f "Pers.Databank-macOS.zip" ]; then
+            echo "::error::The archive Pers.Databank-macOS.zip was not created."
+            exit 1
+          fi
+          if unzip -l "Pers.Databank-macOS.zip" | grep -q "__MACOSX"; then
+            echo "::error::The archive contains a __MACOSX folder."
+            exit 1
+          fi
+          if ! unzip -l "Pers.Databank-macOS.zip" | grep -q "Pers.Databank.app/Contents/MacOS/Pers.Databank"; then
+            echo "::error::The executable is missing from the archive."
+            exit 1
+          fi
+          # Unpack once to be sure
+          mkdir check && cd check
+          ditto -x -k "../Pers.Databank-macOS.zip" .
+          test -x "Pers.Databank.app/Contents/MacOS/Pers.Databank"
+          cd .. && rm -rf check
+          echo "Archive checked: complete and free of __MACOSX."
+
+      - name: Hand over the result
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-program
+          path: Pers.Databank-macOS.zip
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------
+  # 4. Attach both programs to the release
+  # ---------------------------------------------------------------------
+  publish:
+    name: Publish release
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Get the Windows program
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-program
+
+      - name: Get the macOS program
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-program
+
+      - name: Are both files there?
+        run: |
+          set -e
+          for file in "Pers.Databank-Windows.exe" "Pers.Databank-macOS.zip"; do
+            if [ ! -s "$file" ]; then
+              echo "::error::$file is missing or empty."
+              ls -la
+              exit 1
+            fi
+            echo "$file: $(du -h "$file" | cut -f1)"
+          done
+
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -e
+          cat > notes.md <<'TEXT'
+          ## Pers.Databank
+
+          Ready-made programs - Python does **not** need to be installed.
+
+          | System | File | How to start it |
+          |---|---|---|
+          | Windows | `Pers.Databank-Windows.exe` | Double-click it. That is all. |
+          | macOS | `Pers.Databank-macOS.zip` | Unpack, then right-click the app and choose **Open** twice. |
+
+          ### First start on macOS
+
+          The app is not registered with Apple, so macOS reports it as coming
+          from an unidentified developer. Use **right-click - Open - Open**
+          once; after that it starts normally.
+
+          On Windows, SmartScreen may show a similar notice:
+          *More info - Run anyway*.
+
+          ### Where your data is kept
+
+          In the folder `Pers.Databank` in your home directory.
+          TEXT
+
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists - replacing the files."
+            gh release upload "$TAG" \
+              "Pers.Databank-Windows.exe" "Pers.Databank-macOS.zip" \
+              --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            echo "Creating release $TAG."
+            gh release create "$TAG" \
+              "Pers.Databank-Windows.exe" "Pers.Databank-macOS.zip" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Pers.Databank $TAG" \
+              --notes-file notes.md
+          fi
+
+      - name: Show the attached files
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name'
